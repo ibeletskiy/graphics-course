@@ -1,5 +1,8 @@
 #include "App.hpp"
 
+#include <cstdlib>
+#include <string>
+
 #include <etna/Etna.hpp>
 #include <etna/GlobalContext.hpp>
 #include <etna/PipelineManager.hpp>
@@ -74,7 +77,15 @@ App::App()
     resolution = {w, h};
   }
 
-  // TODO: Initialize any additional resources you require here!
+  auto& context = etna::get_context();
+  etna::create_program("toy", {LOCAL_SHADERTOY1_SHADERS_ROOT "toy.comp.spv"});
+  pipeline = context.getPipelineManager().createComputePipeline("toy", {});
+  resultImage = context.createImage(etna::Image::CreateInfo{
+    .extent = {resolution.x, resolution.y, 1},
+    .name = "toy_result",
+    .format = vk::Format::eR8G8B8A8Unorm,
+    .imageUsage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc,
+  });
 }
 
 App::~App()
@@ -87,6 +98,22 @@ void App::run()
   while (!osWindow->isBeingClosed())
   {
     windowing.poll();
+
+    if (osWindow->keyboard[KeyboardKey::kB] == ButtonState::Falling)
+    {
+      std::string command = "\"" LOCAL_SHADERTOY1_CMAKE "\"";
+      command += " --build \"" LOCAL_SHADERTOY1_BUILD_DIR "\"";
+      command += " --config \"" LOCAL_SHADERTOY1_CONFIG "\"";
+      command += " --target local_shadertoy1_shaders";
+#ifdef _WIN32
+      command = "\"" + command + "\"";
+#endif
+      if (std::system(command.c_str()) == 0)
+      {
+        ETNA_CHECK_VK_RESULT(etna::get_context().getDevice().waitIdle());
+        etna::reload_shaders();
+      }
+    }
 
     drawFrame();
   }
@@ -139,7 +166,43 @@ void App::drawFrame()
       etna::flush_barriers(currentCmdBuf);
 
 
-      // TODO: Record your commands here!
+      etna::set_state(currentCmdBuf, resultImage.get(), vk::PipelineStageFlagBits2::eComputeShader,
+        vk::AccessFlagBits2::eShaderStorageWrite, vk::ImageLayout::eGeneral,
+        vk::ImageAspectFlagBits::eColor);
+      auto program = etna::get_shader_program("toy");
+      auto set = etna::create_descriptor_set(program.getDescriptorLayoutId(0), currentCmdBuf,
+        {etna::Binding{0, resultImage.genBinding({}, vk::ImageLayout::eGeneral)}});
+      currentCmdBuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.getVkPipeline());
+      currentCmdBuf.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+        pipeline.getVkPipelineLayout(), 0, {set.getVkSet()}, {});
+
+      struct Params
+      {
+        glm::vec2 resolution;
+        float time;
+      };
+      const Params params{glm::vec2(resolution), static_cast<float>(windowing.getTime())};
+      currentCmdBuf.pushConstants(pipeline.getVkPipelineLayout(), vk::ShaderStageFlagBits::eCompute, 0, sizeof(params), &params);
+      etna::flush_barriers(currentCmdBuf);
+      constexpr uint32_t groupSize = 32;
+      currentCmdBuf.dispatch((resolution.x + groupSize - 1) / groupSize,
+        (resolution.y + groupSize - 1) / groupSize, 1);
+
+      etna::set_state(currentCmdBuf, resultImage.get(), vk::PipelineStageFlagBits2::eTransfer,
+        vk::AccessFlagBits2::eTransferRead, vk::ImageLayout::eTransferSrcOptimal,
+        vk::ImageAspectFlagBits::eColor);
+      etna::flush_barriers(currentCmdBuf);
+      const vk::ImageSubresourceLayers colorLayer{
+        .aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1};
+      const vk::Offset3D end{static_cast<int>(resolution.x), static_cast<int>(resolution.y), 1};
+      const vk::ImageBlit region{
+        .srcSubresource = colorLayer,
+        .srcOffsets = std::array{vk::Offset3D{0, 0, 0}, end},
+        .dstSubresource = colorLayer,
+        .dstOffsets = std::array{vk::Offset3D{0, 0, 0}, end},
+      };
+      currentCmdBuf.blitImage(resultImage.get(), vk::ImageLayout::eTransferSrcOptimal,
+        backbuffer, vk::ImageLayout::eTransferDstOptimal, {region}, vk::Filter::eNearest);
 
 
       // At the end of "rendering", we are required to change how the pixels of the
