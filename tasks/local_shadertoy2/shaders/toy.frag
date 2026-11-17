@@ -1,0 +1,294 @@
+#version 450
+
+layout(location = 0) out vec4 color;
+layout(binding = 0) uniform sampler2D colorTexture;
+layout(binding = 1) uniform sampler2D materialTexture;
+layout(push_constant) uniform Params {
+    vec2 resolution;
+    float time;
+} params;
+
+#define iResolution vec3(params.resolution, 1.0)
+#define iTime params.time
+
+#define AA 2
+
+const float FAR = 30.0;
+const float EPS = 0.001;
+const float PI = 3.1415926535;
+const int MARCH_STEPS = 144;
+const int SHADOW_STEPS = 64;
+const int AO_STEPS = 5;
+const vec3 CAMERA_TARGET = vec3(0, 1.48, 0);
+const float CAMERA_DISTANCE = 5.8;
+const float CAMERA_YAW = 0.45;
+const float CAMERA_PITCH = 0.23;
+const float CAMERA_FOCUS = 2.7;
+const vec3 LIGHT_POSITION = vec3(-3.5, 6.0, 4.0);
+const vec3 FILL_POSITION = vec3(3.0, 4.0, -4.0);
+const float GLOW = 5.0;
+
+mat2 rot(float a) {
+    float c = cos(a), s = sin(a);
+    return mat2(c, -s, s, c);
+}
+
+vec3 headSpace(vec3 p) {
+    p.xz = rot(0.16 * sin(0.9 * iTime)) * p.xz;
+    p.xy = rot(0.055 * sin(1.8 * iTime)) * p.xy;
+    return p;
+}
+
+vec4 paint(vec3 p, vec3 n, out vec2 material) {
+    vec3 w = pow(abs(n), vec3(4.0));
+    w /= w.x + w.y + w.z;
+    p = p * 0.8 + 0.5;
+    material = textureLod(materialTexture, p.yz, 0.0).rg * w.x;
+    material += textureLod(materialTexture, p.zx, 0.0).rg * w.y;
+    material += textureLod(materialTexture, p.xy, 0.0).rg * w.z;
+    vec4 tex = textureLod(colorTexture, p.yz, 0.0) * w.x;
+    tex += textureLod(colorTexture, p.zx, 0.0) * w.y;
+    tex += textureLod(colorTexture, p.xy, 0.0) * w.z;
+    return tex;
+}
+
+float torus(vec3 p, float r, float w) {
+    return length(vec2(length(p.xz) - r, p.y)) - w;
+}
+
+float cylinder(vec3 p, float r, float h) {
+    vec2 d = abs(vec2(length(p.xz), p.y)) - vec2(r, h);
+    return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
+}
+
+vec2 unite(vec2 a, vec2 b) {
+    return a.x < b.x ? a : b;
+}
+
+float box(vec3 p, vec3 b, float r) {
+    vec3 q = abs(p) - b;
+    return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0) - r;
+}
+
+float capsule(vec3 p, vec3 a, vec3 b, float r) {
+    vec3 v = p - a, ab = b - a;
+    return length(v - ab * clamp(dot(v, ab) / dot(ab, ab), 0.0, 1.0)) - r;
+}
+
+vec2 scene(vec3 p) {
+    vec2 d = vec2(p.y, 0.0);
+    d = unite(d, vec2(box(p - vec3(0, 1.20, 0), vec3(0.39, 0.39, 0.25), 0.10), 1.0));
+    d = unite(d, vec2(cylinder(p - vec3(0, 1.76, 0), 0.16, 0.12), 4.0));
+    d = unite(d, vec2(box(p - vec3(0, 1.26, 0.355), vec3(0.27, 0.23, 0.025), 0.04), 3.0));
+
+    for (int i = 0; i < 3; ++i) {
+        vec3 q = p - vec3(-0.12 + 0.12 * float(i), 1.33, 0.415);
+        d = unite(d, vec2(box(q, vec3(0.022, 0.075, 0.01), 0.012), 2.0));
+    }
+    d = unite(d, vec2(length(p - vec3(0.13, 1.10, 0.42)) - 0.052, 6.0));
+    d = unite(d, vec2(length(p - vec3(-0.13, 1.10, 0.42)) - 0.035, 4.0));
+
+    for (int i = 0; i < 2; ++i) {
+        float side = 2.0 * float(i) - 1.0;
+        vec3 leg = p - vec3(side * 0.27, 0.52, 0);
+        d = unite(d, vec2(cylinder(leg, 0.105, 0.27), 4.0));
+        d = unite(d, vec2(box(p - vec3(side * 0.29, 0.17, 0.10), vec3(0.16, 0.09, 0.26), 0.08), 2.0));
+        d = unite(d, vec2(torus(leg, 0.11, 0.025), 2.0));
+
+        vec3 arm = p - vec3(side * 0.57, 1.48, 0);
+        d = unite(d, vec2(length(arm) - 0.16, 4.0));
+        arm.xy = rot(side * (0.20 + 0.23 * sin(1.8 * iTime))) * arm.xy;
+        d = unite(d, vec2(capsule(arm, vec3(0, -0.10, 0), vec3(0, -0.43, 0), 0.09), 2.0));
+        d = unite(d, vec2(box(arm - vec3(0, -0.48, 0), vec3(0.105, 0.085, 0.075), 0.045), 3.0));
+        vec3 claw = arm - vec3(0, -0.64, 0);
+        claw.x = abs(claw.x) - 0.095;
+        d = unite(d, vec2(box(claw, vec3(0.022, 0.075, 0.055), 0.025), 3.0));
+    }
+
+    vec3 head = headSpace(p - vec3(0, 2.12, 0));
+    d = unite(d, vec2(box(head, vec3(0.49, 0.29, 0.27), 0.12), 7.0));
+    d = unite(d, vec2(box(head - vec3(0, 0.01, 0.37), vec3(0.40, 0.20, 0.025), 0.075), 2.0));
+    vec3 ear = head;
+    ear.x = abs(ear.x) - 0.63;
+    d = unite(d, vec2(cylinder(ear.yxz, 0.15, 0.065), 8.0));
+
+    float blink = 1.0 - 0.94 * pow(max(cos(1.4 * iTime + 1.5), 0.0), 32.0);
+    vec3 eye = head - vec3(0.025 * sin(iTime), 0.04, 0.482);
+    eye.x = abs(eye.x) - 0.18;
+    d = unite(d, vec2(box(eye, vec3(0.048, 0.075 * blink, 0.012), 0.025), 5.0));
+    d = unite(d, vec2(box(head - vec3(0, -0.13, 0.482), vec3(0.085, 0.008, 0.008), 0.008), 5.0));
+
+    vec3 tip = vec3(0.10 + 0.08 * sin(2.2 * iTime), 0.82, 0);
+    d = unite(d, vec2(capsule(head, vec3(0, 0.36, 0), tip, 0.028), 4.0));
+    d = unite(d, vec2(length(head - tip) - 0.10, 6.0));
+    vec3 key = p - vec3(0, 1.25, -0.64);
+    d = unite(d, vec2(cylinder((p - vec3(0, 1.25, -0.44)).xzy, 0.065, 0.22), 4.0));
+    key.xy = rot(0.5 * iTime + 0.3) * key.xy;
+    key.x = abs(key.x) - 0.18;
+    d = unite(d, vec2(torus(key.xzy, 0.14, 0.043), 4.0));
+    return d;
+}
+
+vec2 march(vec3 ro, vec3 rd) {
+    float t = 0.0;
+    for (int i = 0; i < MARCH_STEPS; ++i) {
+        vec2 h = scene(ro + rd * t);
+        if (h.x < EPS)
+            return vec2(t, h.y);
+        t += h.x;
+        if (t > FAR)
+            break;
+    }
+    return vec2(FAR, -1.0);
+}
+
+vec3 normal(vec3 p) {
+    vec2 e = vec2(EPS, 0.0);
+    return normalize(vec3(
+        scene(p + e.xyy).x - scene(p - e.xyy).x,
+        scene(p + e.yxy).x - scene(p - e.yxy).x,
+        scene(p + e.yyx).x - scene(p - e.yyx).x));
+}
+
+float shadow(vec3 p, vec3 l, float end) {
+    float shade = 1.0;
+    float t = 0.02;
+    for (int i = 0; i < SHADOW_STEPS; ++i) {
+        float h = scene(p + l * t).x;
+        if (h < EPS)
+            return 0.0;
+        shade = min(shade, 9.0 * h / t);
+        t += clamp(h, 0.01, 0.25);
+        if (t >= end)
+            break;
+    }
+    return clamp(shade, 0.0, 1.0);
+}
+
+float ao(vec3 p, vec3 n) {
+    float occ = 0.0;
+    float weight = 1.0;
+    for (int i = 1; i <= AO_STEPS; ++i) {
+        float h = 0.06 * float(i);
+        occ += (h - scene(p + n * h).x) * weight;
+        weight *= 0.6;
+    }
+    return clamp(1.0 - 2.5 * occ, 0.0, 1.0);
+}
+
+vec3 lighting(vec3 base, float roughness, float metalness, vec3 n, vec3 v, vec3 l, vec3 radiance) {
+    vec3 h = normalize(v + l);
+    float nl = max(dot(n, l), 0.0);
+    float nv = max(dot(n, v), EPS);
+    float nh = max(dot(n, h), 0.0);
+    float vh = max(dot(v, h), 0.0);
+    float alpha = roughness * roughness;
+    float alpha2 = alpha * alpha;
+    float denominator = nh * nh * (alpha2 - 1.0) + 1.0;
+    float distribution = alpha2 / (PI * denominator * denominator);
+    float k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
+    float geometry = nv / (nv * (1.0 - k) + k) * nl / (nl * (1.0 - k) + k);
+    vec3 f0 = mix(vec3(0.04), base, metalness);
+    vec3 fresnel = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
+    vec3 specular = distribution * geometry * fresnel / max(4.0 * nv * nl, EPS);
+    vec3 diffuse = (1.0 - fresnel) * (1.0 - metalness) * base / PI;
+    return (diffuse + specular) * radiance * nl;
+}
+
+vec3 render(vec3 ro, vec3 rd) {
+    vec3 bg = mix(vec3(0.22, 0.19, 0.15), vec3(0.10, 0.13, 0.14), smoothstep(-0.25, 0.6, rd.y));
+    vec2 hit = march(ro, rd);
+    if (hit.y < 0.0)
+        return bg;
+
+    vec3 p = ro + rd * hit.x;
+    vec3 n = normal(p);
+    vec3 base;
+    float roughness = 0.45;
+    float metalness = 0.0;
+    float glow = 0.0;
+    vec2 material;
+
+    if (hit.y < 0.5) {
+        base = vec3(0.34, 0.29, 0.23);
+        roughness = 0.9;
+    } else if (hit.y < 1.5) {
+        vec4 tex = paint(p - vec3(0, 1.20, 0), n, material);
+        base = tex.rgb;
+        glow = tex.a;
+        roughness = material.x;
+        metalness = material.y;
+    } else if (hit.y < 2.5) {
+        base = vec3(0.018, 0.045, 0.055);
+        roughness = 0.28;
+    } else if (hit.y < 3.5) {
+        base = vec3(0.82, 0.73, 0.49);
+        roughness = 0.4;
+        metalness = 0.55;
+    } else if (hit.y < 4.5) {
+        base = vec3(0.44, 0.26, 0.09);
+        roughness = 0.24;
+        metalness = 0.85;
+    } else if (hit.y < 5.5) {
+        base = vec3(0.10, 0.85, 0.70);
+        roughness = 0.3;
+    } else if (hit.y < 6.5) {
+        base = vec3(0.65, 0.025, 0.018);
+        roughness = 0.22;
+    } else if (hit.y < 7.5) {
+        vec4 tex = paint(headSpace(p - vec3(0, 2.12, 0)), headSpace(n), material);
+        base = mix(vec3(0.82, 0.73, 0.49), tex.rgb, 0.65);
+        glow = tex.a;
+        roughness = mix(0.4, material.x, 0.65);
+        metalness = mix(0.55, material.y, 0.65);
+    } else {
+        base = vec3(0.85, 0.20, 0.055);
+        metalness = 0.15;
+    }
+
+    vec3 toLight = LIGHT_POSITION - p;
+    vec3 l = normalize(toLight);
+    float sh = shadow(p + n * (4.0 * EPS), l, length(toLight));
+    float ambient = ao(p, n);
+    vec3 f0 = mix(vec3(0.04), base, metalness);
+    vec3 col = base * (1.0 - metalness) + f0 * (1.0 - 0.6 * roughness);
+    col *= vec3(0.22, 0.30, 0.38) * ambient;
+    col += lighting(base, roughness, metalness, n, -rd, l, PI * vec3(1.65, 1.40, 1.12)) * sh;
+    vec3 fill = normalize(FILL_POSITION - p);
+    col += lighting(base, roughness, metalness, n, -rd, fill, PI * vec3(0.16, 0.32, 0.48)) * ambient;
+    if (hit.y > 4.5 && hit.y < 5.5)
+        col += base * 0.75;
+    col += GLOW * glow * vec3(0.45, 1.0, 0.72);
+    float fog = 1.0 - exp(-0.003 * hit.x * hit.x);
+    return mix(col, bg, fog);
+}
+
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    float yaw = CAMERA_YAW;
+    float pitch = CAMERA_PITCH;
+
+    vec3 target = CAMERA_TARGET;
+    vec3 ro = target + CAMERA_DISTANCE * vec3(sin(yaw) * cos(pitch), sin(pitch), cos(yaw) * cos(pitch));
+    vec3 forward = normalize(target - ro);
+    vec3 right = normalize(cross(forward, vec3(0, 1, 0)));
+    vec3 up = cross(right, forward);
+    vec3 col = vec3(0.0);
+
+    for (int y = 0; y < AA; ++y)
+    for (int x = 0; x < AA; ++x) {
+        vec2 offset = (vec2(float(x), float(y)) + 0.5) / float(AA) - 0.5;
+        vec2 uv = (2.0 * (fragCoord + offset) - iResolution.xy) / iResolution.y;
+        vec3 rd = normalize(right * uv.x + up * uv.y + CAMERA_FOCUS * forward);
+        col += render(ro, rd);
+    }
+    col /= float(AA * AA);
+    vec2 uv = fragCoord / iResolution.xy;
+    col *= 1.0 - 0.22 * dot(uv - 0.5, uv - 0.5);
+    col = col / (1.0 + col);
+    col = pow(col, vec3(1.0 / 2.2));
+    fragColor = vec4(col, 1.0);
+}
+
+void main() {
+    mainImage(color, vec2(gl_FragCoord.x, params.resolution.y - gl_FragCoord.y));
+}
